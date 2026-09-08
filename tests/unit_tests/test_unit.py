@@ -1849,6 +1849,72 @@ def test_train_val_step_functions():
     assert torch.isclose(val_step_loss, train_step_loss)
 
 
+@pytest.mark.parametrize("self_cond_layers", [(), (1,)])
+def test_frames_attend_to_each_other(self_cond_layers):
+    """Adding decoder frames changes the logits of the earlier ones.
+
+    The decoder is non-autoregressive, so its frames are meant to attend
+    to one another. They did not. ``AnalyteTransformerDecoder.embed``
+    infers its key padding mask from the input values, and this decoder
+    feeds token id 0 at every frame, which is ``padding_idx`` and embeds
+    to zero, so every frame was marked padding and only the global
+    precursor token stayed visible. A softmax over one surviving key is
+    1.0, so decoder self-attention returned the same vector at every
+    position: a per-layer bias. No path existed between positions at any
+    depth, since the global token's own query was masked the same way and
+    so could not carry anything either.
+
+    None of that is visible in the output. The frames still produce
+    logits, still receive gradient, and the model still trains. The
+    symptom is here instead: if no frame reads any other, a position's
+    logits cannot depend on how many frames follow it, so lengthening the
+    budget leaves the earlier positions untouched. Measured on a trained
+    checkpoint at 100 frames against 120, over 101 shared positions, at a
+    maximum absolute difference of exactly zero. See
+    ``results/yuhhong/2026-09-08nar_scctc_frame-attn``.
+
+    Both decode paths are covered, since ``forward_self_conditioned``
+    repeats the input preparation instead of calling ``embed``.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=self_cond_layers,
+    ).eval()
+
+    torch.manual_seed(0)
+    batch = {
+        "mz_array": torch.linspace(100.0, 1000.0, 12).repeat(2, 1),
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.full((2,), 600.0),
+        "precursor_charge": torch.full((2,), 2.0),
+    }
+
+    with torch.no_grad():
+        short, _ = model._forward_step(batch)
+        # `max_peptide_len` is the decoder's frame count here, so raising
+        # it is how the budget grows. Add rather than scale: a factor that
+        # happened to reproduce the current value would compare a run
+        # against itself and pass for the wrong reason.
+        model.max_peptide_len = model.max_peptide_len + 8
+        long, _ = model._forward_step(batch)
+
+    shared = short.shape[1]
+    assert long.shape[1] > shared, "the second run must be longer"
+    assert not torch.allclose(long[:, :shared], short), (
+        "the added frames left the earlier positions untouched, so the "
+        "decoder frames are not attending to one another"
+    )
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
