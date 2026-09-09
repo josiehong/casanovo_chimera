@@ -119,11 +119,12 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         at inference.
 
         This has to open up the layer stack rather than call
-        ``transformer_decoder`` in one shot, so it repeats the input
-        preparation from ``embed``: the all-False target mask that makes
-        attention non-causal, and no key padding mask, since every frame
-        is a real decoding slot. See ``embed`` for why the superclass's
-        inferred padding mask is wrong here.
+        ``transformer_decoder`` in one shot. The input comes from
+        ``_input_sequence``, shared with ``embed``; the masks are the
+        all-False target mask that makes attention non-causal, and no key
+        padding mask, since every frame is a real decoding slot. See
+        ``embed`` for why the superclass's inferred padding mask is wrong
+        here.
 
         Returns
         -------
@@ -134,13 +135,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             CTC losses. Empty when self-conditioning is off, in which
             case the scores match ``forward`` exactly.
         """
-        if tokens is None:
-            tokens = torch.tensor([[]]).to(self.device)
-
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-        encoded = self.positional_encoder(encoded)
+        encoded = self._input_sequence(tokens, *args, **kwargs)
 
         # Non-causal attention, as in `embed` above: every frame sees
         # every other frame. No key padding mask for the same reason
@@ -202,6 +197,50 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         precursors = masses + charges
         return precursors
 
+    def _input_sequence(
+        self,
+        tokens: torch.Tensor | None,
+        *args: torch.Tensor,
+        **kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        The decoder's input: the precursor token, then one per frame.
+
+        The precursor is added to every frame, not just prepended. It is
+        the only route by which precursor mass and charge reach the
+        model, since the encoder is called with peaks alone. The old key
+        padding mask left position 0 as the only visible key, so every
+        frame received it at full weight; unmasking the frames diluted it
+        to about 1/101 and the model had to spend layers 1 and 2 winning
+        it back. Adding it directly frees those layers.
+
+        Both decode paths call this instead of building the input
+        themselves, which is how the padding mask came to be wrong in two
+        places rather than one.
+
+        No parameter is added, so checkpoints still load.
+
+        Parameters
+        ----------
+        tokens : torch.Tensor or None
+            Frame placeholders, all padding_idx for this decoder.
+        *args, **kwargs
+            Passed to ``global_token_hook``, which needs ``precursors``.
+
+        Returns
+        -------
+        torch.Tensor of shape (batch, 1 + n_frames, d_model)
+            The positionally encoded input sequence.
+        """
+        if tokens is None:
+            tokens = torch.tensor([[]]).to(self.device)
+
+        encoded = self.token_encoder(tokens)
+        global_token = self.global_token_hook(tokens, *args, **kwargs)
+        encoded = encoded + global_token[:, None, :]
+        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
+        return self.positional_encoder(encoded)
+
     def embed(
         self,
         tokens: torch.Tensor | None,
@@ -250,13 +289,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         behaviour. They still load, since no parameter shape changes, but
         they were fit to a decoder whose frames were independent.
         """
-        if tokens is None:
-            tokens = torch.tensor([[]]).to(self.device)
-
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-        encoded = self.positional_encoder(encoded)
+        encoded = self._input_sequence(tokens, *args, **kwargs)
 
         if tgt_mask is None:
             length = encoded.shape[1]

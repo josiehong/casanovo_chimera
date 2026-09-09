@@ -1915,6 +1915,49 @@ def test_frames_attend_to_each_other(self_cond_layers):
     )
 
 
+def test_every_frame_carries_the_precursor():
+    """The precursor reaches each frame directly, not only via attention.
+
+    It is the sole route by which precursor mass and charge enter the
+    model: the encoder is called with peaks alone. Prepending it as one
+    key among 1 + n_frames left it at about 1/101 strength, so it is
+    added to every frame instead.
+
+    Checked on the decoder input rather than the output, where attention
+    would confound it: two spectra differing only in precursor must
+    differ at every frame position.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        max_peptide_len=6,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    ).eval()
+
+    tokens = torch.zeros(1, model.max_peptide_len, dtype=torch.long)
+    low = torch.tensor([[600.0, 2.0, 301.0]])
+    high = torch.tensor([[1800.0, 2.0, 901.0]])
+    with torch.no_grad():
+        a = model.decoder._input_sequence(tokens, precursors=low)
+        b = model.decoder._input_sequence(tokens, precursors=high)
+
+    # Position 0 is the precursor token and differs either way; the
+    # frames are what this branch changes.
+    assert not torch.allclose(a[:, 1:], b[:, 1:]), (
+        "the frames are identical for different precursors, so the "
+        "precursor is not being broadcast to them"
+    )
+    # The same offset reaches every frame.
+    delta = (b - a)[0, 1:]
+    assert torch.allclose(delta, delta[0].expand_as(delta), atol=1e-6)
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
